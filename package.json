@@ -1,0 +1,23 @@
+{
+  "name": "crasher-nwf",
+  "version": "1.0.0",
+  "description": "Crasher-NWF - A 2D Side-scrolling Action Game with gesture-based slashing mechanics.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "node stage8-build.js && npx cap sync"
+  },
+  "keywords": [],
+  "author": "Crasher-NWF Team",
+  "license": "ISC",
+  "dependencies": {
+    "@capacitor/android": "^6.0.0",
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/haptics": "^6.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.0.0"
+  }
+}
