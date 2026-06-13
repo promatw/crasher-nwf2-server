@@ -156,6 +156,7 @@ wss.on('connection', (ws) => {
                     broadcast({
                         type: 'peer_move',
                         id: state.id,
+                        color: state.color,
                         x: state.x,
                         y: state.y,
                         vx: state.vx,
