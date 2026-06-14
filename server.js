@@ -49,17 +49,11 @@ function updateHostSelection() {
 
 wss.on('connection', (ws) => {
     ws.isAlive = true;
+    ws.missedPings = 0;
     ws.on('pong', () => {
         ws.isAlive = true;
+        ws.missedPings = 0;
     });
-
-    // Limit lobby to maximum 3 players
-    if (clients.size >= 3) {
-        console.log(`[Lobby] Rejecting connection. Room is full (3/3).`);
-        ws.send(JSON.stringify({ type: 'error', message: 'Room full' }));
-        ws.close();
-        return;
-    }
 
     const playerId = nextPlayerId++;
     const assignedColor = NEON_COLORS[playerId % NEON_COLORS.length];
@@ -74,7 +68,7 @@ wss.on('connection', (ws) => {
         hp: 100
     };
 
-    console.log(`[Lobby] Player ${playerId} connected. Color: ${assignedColor}. Active: ${clients.size + 1}/3`);
+    console.log(`[Lobby] Temporary Player ${playerId} connected. Color: ${assignedColor}.`);
 
     // 1. Send welcome configurations to the new client
     ws.send(JSON.stringify({
@@ -84,22 +78,33 @@ wss.on('connection', (ws) => {
         state: playerState
     }));
 
+    // 5秒內若未發送 join 訊息，主動超時中斷以釋放資源
+    const joinTimeout = setTimeout(() => {
+        if (!clients.has(ws)) {
+            console.log(`[Lobby] Closing connection: Join timeout (5s) for temporary Player ${playerId}.`);
+            ws.close();
+        }
+    }, 5000);
+
     // Message routing
     ws.on('message', (message) => {
         ws.isAlive = true;
+        ws.missedPings = 0;
         try {
             const data = JSON.parse(message);
             
             if (data.type === 'ping') {
                 ws.isAlive = true;
+                ws.missedPings = 0;
                 // Return pong to measure rtt latency
                 ws.send(JSON.stringify({ type: 'pong', time: data.time }));
             }
             else if (data.type === 'join') {
+                clearTimeout(joinTimeout);
                 const deviceUuid = data.deviceUuid;
                 playerState.deviceUuid = deviceUuid;
                 
-                // 剔除相同 deviceUuid 的舊幽靈連線
+                // 1. 剔除相同 deviceUuid 的舊幽靈連線
                 clients.forEach((state, clientSocket) => {
                     if (state.deviceUuid === deviceUuid && clientSocket !== ws) {
                         console.log(`[Lobby] Kicking duplicate device connection for Player ${state.id}`);
@@ -112,7 +117,17 @@ wss.on('connection', (ws) => {
                     }
                 });
                 
-                // 2. Broadcast current existing players to the new client
+                // 2. 檢查房間是否已滿 (上限 3 人)
+                if (clients.size >= 3) {
+                    console.log(`[Lobby] Rejecting join from Player ${playerId}. Room is full (${clients.size}/3).`);
+                    ws.send(JSON.stringify({ type: 'error', message: 'Room full' }));
+                    ws.close();
+                    return;
+                }
+
+                console.log(`[Lobby] Player ${playerId} joined lobby. Active: ${clients.size + 1}/3`);
+                
+                // 3. Broadcast current existing players to the new client
                 const existingPeers = [];
                 clients.forEach((state, clientSocket) => {
                     if (clientSocket.readyState === WebSocket.OPEN && clientSocket !== ws) {
@@ -127,16 +142,16 @@ wss.on('connection', (ws) => {
                     }));
                 }
 
-                // 3. Register the new client
+                // 4. Register the new client
                 clients.set(ws, playerState);
 
-                // 4. Notify existing clients that a new player joined
+                // 5. Notify existing clients that a new player joined
                 broadcast({
                     type: 'peer_join',
                     peer: playerState
                 }, ws);
 
-                // 5. Update host selection
+                // 6. Update host selection
                 updateHostSelection();
             }
             else if (data.type === 'move') {
@@ -264,6 +279,7 @@ wss.on('connection', (ws) => {
 
     // Cleanup on disconnect
     ws.on('close', () => {
+        clearTimeout(joinTimeout);
         const state = clients.get(ws);
         if (state) {
             clients.delete(ws);
@@ -302,10 +318,16 @@ function broadcast(data, excludeWs = null) {
 const heartbeatInterval = setInterval(() => {
     wss.clients.forEach((ws) => {
         if (ws.isAlive === false) {
-            console.log(`[Heartbeat] Terminating inactive connection for Player ${clients.get(ws)?.id || 'unknown'}`);
-            return ws.terminate();
+            ws.missedPings = (ws.missedPings || 0) + 1;
+            console.log(`[Heartbeat] Missed ping count: ${ws.missedPings}/3 for Player ${clients.get(ws)?.id || 'unknown'}`);
+            if (ws.missedPings >= 3) {
+                console.log(`[Heartbeat] Terminating inactive connection for Player ${clients.get(ws)?.id || 'unknown'}`);
+                return ws.terminate();
+            }
+        } else {
+            ws.isAlive = false;
+            ws.missedPings = 0;
         }
-        ws.isAlive = false;
         try {
             ws.ping(); // Send active protocol-level ping
         } catch (e) {
