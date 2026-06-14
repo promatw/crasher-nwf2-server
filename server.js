@@ -117,13 +117,17 @@ wss.on('connection', (ws) => {
                     }
                     
                     // 關閉舊連線
-                    if (session.socket && session.socket !== ws && session.socket.readyState === WebSocket.OPEN) {
-                        try { session.socket.close(); } catch(e) {}
-                        clients.delete(session.socket);
+                    if (session.socket && session.socket !== ws) {
+                        const oldSocket = session.socket;
+                        // 先將 session.socket 設為新連線，防範舊連線 close 觸發錯誤離線封包
+                        session.socket = ws;
+                        if (oldSocket.readyState === WebSocket.OPEN) {
+                            try { oldSocket.close(); } catch(e) {}
+                        }
+                        clients.delete(oldSocket);
+                    } else {
+                        session.socket = ws;
                     }
-                    
-                    // 恢復屬性
-                    session.socket = ws;
                     playerState.id = session.id;
                     playerState.color = session.color;
                     playerState.x = session.x;
@@ -309,6 +313,16 @@ wss.on('connection', (ws) => {
                     currentHostSocket.send(JSON.stringify({ type: 'request_restart' }));
                 }
             }
+            else if (data.type === 'game_continue') {
+                // Relay game continue event to all peers
+                broadcast(data, ws);
+            }
+            else if (data.type === 'request_continue') {
+                // Forward continue request to the current host
+                if (currentHostSocket && currentHostSocket.readyState === WebSocket.OPEN) {
+                    currentHostSocket.send(JSON.stringify({ type: 'request_continue' }));
+                }
+            }
             else if (data.type === 'lightning_slash') {
                 // Relay lightning slash points to all other peers
                 const state = clients.get(ws);
@@ -378,38 +392,53 @@ wss.on('connection', (ws) => {
     // Cleanup on disconnect
     ws.on('close', () => {
         clearTimeout(joinTimeout);
+        
+        // 1. 房主中斷時，立刻遷移 Host Identity
+        if (ws === currentHostSocket) {
+            currentHostSocket = null;
+            updateHostSelection();
+        }
+
+        // 2. 從 clients 刪除
         const state = clients.get(ws);
         if (state) {
             clients.delete(ws);
+        }
+
+        // 3. 尋找與該 ws 綁定的 session（不依賴於 state 是否存在，更安全）
+        let targetSession = null;
+        let targetDeviceUuid = null;
+        sessions.forEach((session, uuid) => {
+            if (session.socket === ws) {
+                targetSession = session;
+                targetDeviceUuid = uuid;
+            }
+        });
+
+        if (targetSession) {
+            console.log(`[Session] Player ${targetSession.id} (device: ${targetDeviceUuid}) socket closed. Keeping session for 15s.`);
             
-            // 房主中斷時，立刻遷移 Host Identity
-            if (ws === currentHostSocket) {
-                currentHostSocket = null;
-                updateHostSelection();
+            // 廣播給其他戰友該玩家暫時斷線中斷
+            broadcast({
+                type: 'peer_offline',
+                id: targetSession.id
+            });
+            
+            if (targetSession.disconnectTimeout) {
+                clearTimeout(targetSession.disconnectTimeout);
             }
             
-            const session = sessions.get(state.deviceUuid);
-            if (session && session.socket === ws) {
-                console.log(`[Session] Player ${state.id} disconnected. Keeping session for 15s.`);
+            // 啟動 15 秒寬限期
+            targetSession.disconnectTimeout = setTimeout(() => {
+                console.log(`[Session] Player ${targetSession.id} session expired. Purging.`);
+                sessions.delete(targetDeviceUuid);
                 
-                // 廣播給其他戰友該玩家暫時斷線中斷
+                // 超時仍未重連，廣播 peer_leave 移除人物
                 broadcast({
-                    type: 'peer_offline',
-                    id: state.id
+                    type: 'peer_leave',
+                    id: targetSession.id
                 });
-                
-                // 啟動 15 秒寬限期
-                session.disconnectTimeout = setTimeout(() => {
-                    console.log(`[Session] Player ${state.id} session expired. Purging.`);
-                    sessions.delete(state.deviceUuid);
-                    
-                    // 超時仍未重連，廣播 peer_leave 移除人物
-                    broadcast({
-                        type: 'peer_leave',
-                        id: state.id
-                    });
-                }, 15000);
-            }
+            }, 15000);
         }
     });
 
