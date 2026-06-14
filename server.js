@@ -5,6 +5,7 @@ const wss = new WebSocket.Server({ port: PORT });
 
 // Active clients tracking: Map of client -> { id, color, x, y, vx, vy, hp }
 const clients = new Map();
+const sessions = new Map(); // persistent sessions mapping deviceUuid -> state
 let nextPlayerId = 1;
 let currentHostSocket = null;
 
@@ -102,24 +103,74 @@ wss.on('connection', (ws) => {
             else if (data.type === 'join') {
                 clearTimeout(joinTimeout);
                 const deviceUuid = data.deviceUuid;
-                playerState.deviceUuid = deviceUuid;
                 
-                // 1. 剔除相同 deviceUuid 的舊幽靈連線
-                clients.forEach((state, clientSocket) => {
-                    if (state.deviceUuid === deviceUuid && clientSocket !== ws) {
-                        console.log(`[Lobby] Kicking duplicate device connection for Player ${state.id}`);
-                        try { clientSocket.close(); } catch(e) {}
-                        clients.delete(clientSocket);
-                        broadcast({
-                            type: 'peer_leave',
-                            id: state.id
-                        });
+                // 1. 檢查是否存在已有 Session 進行重連恢復
+                let session = sessions.get(deviceUuid);
+                if (session) {
+                    console.log(`[Session] Player ${session.id} (device: ${deviceUuid}) reconnected. Restoring state.`);
+                    
+                    if (session.disconnectTimeout) {
+                        clearTimeout(session.disconnectTimeout);
+                        session.disconnectTimeout = null;
                     }
-                });
+                    
+                    // 關閉舊連線
+                    if (session.socket && session.socket !== ws && session.socket.readyState === WebSocket.OPEN) {
+                        try { session.socket.close(); } catch(e) {}
+                        clients.delete(session.socket);
+                    }
+                    
+                    // 恢復屬性
+                    session.socket = ws;
+                    playerState.id = session.id;
+                    playerState.color = session.color;
+                    playerState.x = session.x;
+                    playerState.y = session.y;
+                    playerState.vx = session.vx;
+                    playerState.vy = session.vy;
+                    playerState.hp = session.hp;
+                    playerState.downed = session.downed;
+                    playerState.deviceUuid = deviceUuid;
+                    
+                    clients.set(ws, playerState);
+                    
+                    // 傳送 welcome back 包含正確的舊 ID 與舊色彩
+                    ws.send(JSON.stringify({
+                        type: 'welcome',
+                        id: session.id,
+                        color: session.color,
+                        state: playerState,
+                        isReconnect: true
+                    }));
+                    
+                    // 同步大廳戰友給重連者
+                    const existingPeers = [];
+                    clients.forEach((state, clientSocket) => {
+                        if (clientSocket.readyState === WebSocket.OPEN && clientSocket !== ws) {
+                            existingPeers.push(state);
+                        }
+                    });
+                    if (existingPeers.length > 0) {
+                        ws.send(JSON.stringify({
+                            type: 'sync_peers',
+                            peers: existingPeers
+                        }));
+                    }
+                    
+                    // 廣播給其他戰友，使其清除 offline 斷線樣式
+                    broadcast({
+                        type: 'peer_join',
+                        peer: playerState,
+                        isReconnect: true
+                    }, ws);
+                    
+                    updateHostSelection();
+                    return;
+                }
                 
-                // 2. 檢查房間是否已滿 (上限 3 人)
-                if (clients.size >= 3) {
-                    console.log(`[Lobby] Rejecting join from Player ${playerId}. Room is full (${clients.size}/3).`);
+                // 2. 檢查房間是否已滿 (上限 3 人，只算 active/grace-period sessions 佔用個數)
+                if (sessions.size >= 3) {
+                    console.log(`[Lobby] Rejecting join from Player ${playerId}. Room is full (${sessions.size}/3).`);
                     ws.send(JSON.stringify({ type: 'error', message: 'Room full' }));
                     ws.close();
                     return;
@@ -143,7 +194,23 @@ wss.on('connection', (ws) => {
                 }
 
                 // 4. Register the new client
+                playerState.deviceUuid = deviceUuid;
                 clients.set(ws, playerState);
+                
+                // 註冊 Session 狀態
+                sessions.set(deviceUuid, {
+                    id: playerId,
+                    color: assignedColor,
+                    x: playerState.x,
+                    y: playerState.y,
+                    vx: playerState.vx,
+                    vy: playerState.vy,
+                    hp: playerState.hp,
+                    downed: playerState.downed || false,
+                    stats: { damageDealt: 0, kills: 0, revives: 0 },
+                    socket: ws,
+                    disconnectTimeout: null
+                });
 
                 // 5. Notify existing clients that a new player joined
                 broadcast({
@@ -166,6 +233,17 @@ wss.on('connection', (ws) => {
                     state.downed = data.downed;
                     state.aimActive = data.aimActive;
                     state.aimAngle = data.aimAngle;
+                    
+                    // 同步更新 session 中的位置以防斷線時備份
+                    const session = sessions.get(state.deviceUuid);
+                    if (session) {
+                        session.x = data.x;
+                        session.y = data.y;
+                        session.vx = data.vx;
+                        session.vy = data.vy;
+                        session.hp = data.hp;
+                        session.downed = data.downed;
+                    }
                     
                     // Relay position updates to all other peers
                     broadcast({
@@ -263,6 +341,14 @@ wss.on('connection', (ws) => {
             else if (data.type === 'player_stats_report') {
                 const state = clients.get(ws);
                 if (state) {
+                    const session = sessions.get(state.deviceUuid);
+                    if (session) {
+                        session.stats = {
+                            damageDealt: data.damageDealt,
+                            kills: data.kills,
+                            revives: data.revives
+                        };
+                    }
                     broadcast({
                         type: 'player_stats_report',
                         playerId: state.id,
@@ -283,18 +369,34 @@ wss.on('connection', (ws) => {
         const state = clients.get(ws);
         if (state) {
             clients.delete(ws);
-            console.log(`[Lobby] Player ${state.id} disconnected. Active: ${clients.size}/3`);
             
-            // Notify other peers to purge this player instance
-            broadcast({
-                type: 'peer_leave',
-                id: state.id
-            });
-            
-            // If the disconnected client was the host, migrate host identity
+            // 房主中斷時，立刻遷移 Host Identity
             if (ws === currentHostSocket) {
                 currentHostSocket = null;
                 updateHostSelection();
+            }
+            
+            const session = sessions.get(state.deviceUuid);
+            if (session) {
+                console.log(`[Session] Player ${state.id} disconnected. Keeping session for 15s.`);
+                
+                // 廣播給其他戰友該玩家暫時斷線中斷
+                broadcast({
+                    type: 'peer_offline',
+                    id: state.id
+                });
+                
+                // 啟動 15 秒寬限期
+                session.disconnectTimeout = setTimeout(() => {
+                    console.log(`[Session] Player ${state.id} session expired. Purging.`);
+                    sessions.delete(state.deviceUuid);
+                    
+                    // 超時仍未重連，廣播 peer_leave 移除人物
+                    broadcast({
+                        type: 'peer_leave',
+                        id: state.id
+                    });
+                }, 15000);
             }
         }
     });
