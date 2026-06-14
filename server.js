@@ -66,7 +66,9 @@ wss.on('connection', (ws) => {
         y: 1000,
         vx: 0,
         vy: 0,
-        hp: 100
+        hp: 100,
+        builds: { frost: 0, overload: 0, orbital: 0, fire: 0 },
+        synergies: { frostfire: false, overloadOrbital: false, frostOverload: false }
     };
 
     console.log(`[Lobby] Temporary Player ${playerId} connected. Color: ${assignedColor}.`);
@@ -130,6 +132,8 @@ wss.on('connection', (ws) => {
                     playerState.vy = session.vy;
                     playerState.hp = session.hp;
                     playerState.downed = session.downed;
+                    playerState.builds = session.builds || { frost: 0, overload: 0, orbital: 0, fire: 0 };
+                    playerState.synergies = session.synergies || { frostfire: false, overloadOrbital: false, frostOverload: false };
                     playerState.deviceUuid = deviceUuid;
                     
                     clients.set(ws, playerState);
@@ -207,6 +211,8 @@ wss.on('connection', (ws) => {
                     vy: playerState.vy,
                     hp: playerState.hp,
                     downed: playerState.downed || false,
+                    builds: playerState.builds || { frost: 0, overload: 0, orbital: 0, fire: 0 },
+                    synergies: playerState.synergies || { frostfire: false, overloadOrbital: false, frostOverload: false },
                     stats: { damageDealt: 0, kills: 0, revives: 0 },
                     socket: ws,
                     disconnectTimeout: null
@@ -233,6 +239,8 @@ wss.on('connection', (ws) => {
                     state.downed = data.downed;
                     state.aimActive = data.aimActive;
                     state.aimAngle = data.aimAngle;
+                    if (data.builds) state.builds = data.builds;
+                    if (data.synergies) state.synergies = data.synergies;
                     
                     // 同步更新 session 中的位置以防斷線時備份
                     const session = sessions.get(state.deviceUuid);
@@ -243,6 +251,8 @@ wss.on('connection', (ws) => {
                         session.vy = data.vy;
                         session.hp = data.hp;
                         session.downed = data.downed;
+                        if (data.builds) session.builds = data.builds;
+                        if (data.synergies) session.synergies = data.synergies;
                     }
                     
                     // Relay position updates to all other peers
@@ -257,7 +267,9 @@ wss.on('connection', (ws) => {
                         hp: state.hp,
                         downed: state.downed,
                         aimActive: state.aimActive,
-                        aimAngle: state.aimAngle
+                        aimAngle: state.aimAngle,
+                        builds: state.builds,
+                        synergies: state.synergies
                     }, ws);
                 }
             }
@@ -377,7 +389,7 @@ wss.on('connection', (ws) => {
             }
             
             const session = sessions.get(state.deviceUuid);
-            if (session) {
+            if (session && session.socket === ws) {
                 console.log(`[Session] Player ${state.id} disconnected. Keeping session for 15s.`);
                 
                 // 廣播給其他戰友該玩家暫時斷線中斷
